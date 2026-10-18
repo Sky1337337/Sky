@@ -22,20 +22,126 @@ def normalize(text: str) -> str:
 
 
 def question_text(text: str) -> str:
-    """Remove phone chrome and answer options; keep the first visible question."""
-    text = text.strip()
-    numbered = re.search(r'(?:^|\n)\s*(?:[IVXLCІМ]+\.\s*)?\d{1,3}\.\s*(?=[А-ЯІЇЄҐ])', text, re.I)
-    if numbered:
-        text = text[numbered.end():]
-    else:
-        start = re.search(r'\b(?:Яка|Яке|Які|Яку|Який|Як|Що|Чи|Коли|Кому|Куди|Де|Скільки|З якою|З яких|Для чого|До якого|На якій|У яких|В яких)\b', text)
-        if start:
-            text = text[start.start():]
-    if '?' in text:
-        text = text.split('?', 1)[0] + '?'
-    else:
-        text = re.split(r'\n\s*(?:Відповідь|Варіант)\b', text, maxsplit=1)[0]
-    return text
+    """Remove quiz chrome and options without discarding the question's context."""
+    text = text.strip().replace('\r\n', '\n')
+    lines = text.splitlines()
+    chrome = re.compile(r'(?:\d{1,2}:\d{2}(?:\s+.*)?|Головна(?:\s+Навчання)?|Навчання|Освітній портал)', re.I)
+    while lines and chrome.fullmatch(lines[0].strip()):
+        lines.pop(0)
+    text = '\n'.join(lines).strip()
+    # A relative word such as «що» or an internal «Який» is part of the question,
+    # not a safe boundary at which to discard its preceding scenario.
+    text = re.sub(r'^\s*Питання\s*(?:№\s*)?\d+\s*[:.)]?\s*', '', text, count=1, flags=re.I)
+    text = re.sub(r'^\s*(?:[IVXLCІМ]+\.\s*)?\d{1,3}[.)]\s*', '', text, count=1, flags=re.I)
+    options = list(re.finditer(r'(?im)(?:^|\n)[ \t]*(?:[A-DА-Г]|[1-9])[ \t]*[).:：][ \t]*', text))
+    if options and options[0].start() > 0:
+        prefix = text[:options[0].start()].rstrip()
+        if len(options) > 1 or prefix.endswith(('?', ':')):
+            text = prefix
+    text = re.split(r'\n\s*(?:Відповідь|Варіант)\b', text, maxsplit=1, flags=re.I)[0]
+    # This bank note is not wording shown in the actual quiz (safety:5/:126).
+    text = re.split(r'\s+УВАГА!\s*На порталі\b', text, maxsplit=1, flags=re.I)[0]
+    return text.strip()
+
+
+def _parenthetical_answer(text: str) -> str:
+    """Keep only balanced parenthetical content, preserving nested explanations."""
+    parts = []
+    depth = 0
+    start = 0
+    for index, character in enumerate(text):
+        if character == '(':
+            if depth == 0:
+                start = index + 1
+            depth += 1
+        elif character == ')' and depth:
+            depth -= 1
+            if depth == 0:
+                content = re.sub(r'\s+', ' ', text[start:index]).strip()
+                if content:
+                    parts.append(content)
+    return '; '.join(parts)
+
+
+
+def parse_answer_options(text: str) -> list[tuple[str, str]]:
+    """Extract multiple-choice options from pasted question text. Supports A)/А), A., and 1) formats."""
+    if not text:
+        return []
+    marker = re.compile(r'(?im)(?:^|\n)\s*([A-DА-Г]|[1-9])\s*[).:：]\s*')
+    matches = list(marker.finditer(text))
+    if len(matches) < 2:
+        return []
+    options = []
+    for i, match in enumerate(matches):
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        value = re.sub(r'\s+', ' ', text[start:end]).strip(' \t\r\n;')
+        if value:
+            label = match.group(1).upper()
+            options.append((label, value))
+    return options
+
+def find_answer_option(answer: str, options: list[tuple[str, str]]) -> tuple[str, str] | None:
+    """Match a saved answer to a supplied option conservatively; avoids guessing on weak matches.
+
+    Combo answers such as "зазначене у п.п. 2 та 3 (detail 2; detail 3)" must
+    be matched by their details, not by the generic phrase "зазначене у п.п. 2 та 3".
+    """
+    target = normalize(answer)
+    if not target or not options:
+        return None
+
+    # Resolve combination answers by comparing the explanation for each referenced
+    # statement with the corresponding individual option in the pasted test.
+    combo = re.search(r'зазначене\s+у\s+п\.?\s*п\.?\s*((?:\d\s*(?:,|та|і|і\s*)?\s*)+)', answer, re.I)
+    detail_match = re.search(r'\((.*?)\)', answer)
+    if combo and detail_match:
+        refs = [int(n) for n in re.findall(r'\d+', combo.group(1))]
+        details = [x.strip() for x in re.split(r'[;；]', detail_match.group(1)) if x.strip()]
+        by_label = {label: value for label, value in options}
+        if refs and len(refs) == len(details) and all(str(n) in by_label for n in refs):
+            all_match = True
+            for n, detail in zip(refs, details):
+                detail_norm = normalize(detail)
+                option_norm = normalize(by_label[str(n)])
+                detail_tokens, option_tokens = set(detail_norm.split()), set(option_norm.split())
+                overlap = len(detail_tokens & option_tokens) / max(1, len(detail_tokens))
+                ratio = SequenceMatcher(None, detail_norm, option_norm, autojunk=False).ratio()
+                if max(overlap, ratio) < 0.48:
+                    all_match = False
+                    break
+            if all_match:
+                ref_set = set(refs)
+                for label, value in options:
+                    candidate_refs = re.search(r'п\.?\s*п\.?\s*((?:\d\s*(?:,|та|і|\s)*\s*)+)', value, re.I)
+                    if candidate_refs and set(int(n) for n in re.findall(r'\d+', candidate_refs.group(1))) == ref_set:
+                        return label, value
+
+    scored = []
+    for label, value in options:
+        candidate = normalize(value)
+        if not candidate:
+            continue
+        # A generic combination label is not evidence by itself; the detailed
+        # source answer must have passed the comparison above.
+        if re.search(r'зазначене\s+у\s+п\.?\s*п\.?', value, re.I) and detail_match:
+            continue
+        if target == candidate or target in candidate or candidate in target:
+            scored.append((1.0, label, value))
+            continue
+        a, b = set(target.split()), set(candidate.split())
+        overlap = len(a & b) / max(1, len(a))
+        ratio = SequenceMatcher(None, target, candidate, autojunk=False).ratio()
+        scored.append((max(overlap, ratio), label, value))
+    if not scored:
+        return None
+    scored.sort(reverse=True)
+    best = scored[0]
+    if best[0] >= 0.78 and (len(scored) == 1 or best[0] - scored[1][0] >= 0.08):
+        return best[1], best[2]
+    return None
+
 
 
 @dataclass(frozen=True)
@@ -66,6 +172,33 @@ class EducationBank:
         freq = Counter(t for words in self._tokens.values() for t in words)
         self._idf = {t: math.log(1 + len(self.questions) / count) for t, count in freq.items()}
         self._visual = None
+
+    def duplicate_parenthetical_answers(self, query: str, block: str | None = None) -> list[str]:
+        """Return distinct parenthetical answer text for exact duplicate questions.
+
+        Used for quiz variants where the same question wording is stored multiple
+        times with different answer combinations. The UI displays only the text
+        inside parentheses, one saved answer per line, without option numbers.
+        """
+        target = normalize(question_text(query))
+        if not target:
+            return []
+        duplicates = [
+            q for q in self.questions
+            if (not block or q.block == block)
+            and self._normalized.get(q.id) == target
+        ]
+        if len(duplicates) < 2:
+            return []
+        answers = []
+        seen = set()
+        for q in duplicates:
+            answer = _parenthetical_answer(q.answer)
+            key = normalize(answer)
+            if answer and key not in seen:
+                seen.add(key)
+                answers.append(answer)
+        return answers
 
     def image_path(self, question: Question) -> Path | None:
         if not question.image:

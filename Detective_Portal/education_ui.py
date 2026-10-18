@@ -8,7 +8,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image, ImageGrab, ImageOps
 
-from education import EducationBank, Match, recognize_image
+from education import EducationBank, Match, recognize_image, parse_answer_options, find_answer_option
 
 
 class EducationPage(ctk.CTkFrame):
@@ -19,9 +19,9 @@ class EducationPage(ctk.CTkFrame):
         self.busy = False
         self.events = queue.Queue()
         self.matches = []
+        self.summary_answers = None
         self.shown = 0
         self._timer = None
-        self._paste_binding = None
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(4, weight=1)
         ctk.CTkLabel(self, text=f'{len(self.bank.blocks)} блоків · {len(self.bank.questions)} запитання · пошук за текстом і фото',
@@ -36,18 +36,21 @@ class EducationPage(ctk.CTkFrame):
         input_card = ctk.CTkFrame(self, corner_radius=12)
         input_card.grid(row=2, column=0, sticky='ew')
         input_card.grid_columnconfigure(0, weight=1)
-        self.text = ctk.CTkTextbox(input_card, height=100, wrap='word', font=('Segoe UI', 13))
+        self.text = ctk.CTkTextbox(input_card, height=140, wrap='word', font=('Segoe UI', 13))
         self.text.grid(row=0, column=0, sticky='ew', padx=10, pady=10)
         self.preview = ctk.CTkLabel(input_card, text='', width=110)
         self.preview.grid(row=0, column=1, padx=(0, 10))
         actions = ctk.CTkFrame(input_card, fg_color='transparent')
         actions.grid(row=1, column=0, columnspan=2, sticky='ew', padx=10, pady=(0, 10))
+        for column in range(3):
+            actions.grid_columnconfigure(column, weight=1)
+        ctk.CTkButton(actions, text='Вставити текст', width=115, command=self.paste_text).grid(row=0, column=0, sticky='ew', padx=(0, 6), pady=(0, 6))
         self.search_button = ctk.CTkButton(actions, text='Знайти відповідь', command=self.search, fg_color='#0D9488', hover_color='#0F766E')
-        self.search_button.pack(side='left', padx=(0, 6))
-        ctk.CTkButton(actions, text='Скриншот · Ctrl+V', width=145, command=self.paste_image).pack(side='left', padx=(0, 6))
-        ctk.CTkButton(actions, text='Відкрити фото', width=115, command=self.load_image).pack(side='left', padx=(0, 6))
-        ctk.CTkButton(actions, text='Очистити', width=80, command=self.clear).pack(side='left')
-        self.status = ctk.CTkLabel(self, text='Вставте запитання або скриншот одного запитання разом із його фото.',
+        self.search_button.grid(row=0, column=1, sticky='ew', padx=(0, 6), pady=(0, 6))
+        ctk.CTkButton(actions, text='Скриншот · Ctrl+V', width=145, command=self.paste_image).grid(row=0, column=2, sticky='ew', pady=(0, 6))
+        ctk.CTkButton(actions, text='Відкрити фото', width=115, command=self.load_image).grid(row=1, column=0, sticky='ew', padx=(0, 6))
+        ctk.CTkButton(actions, text='Очистити', width=80, command=self.clear).grid(row=1, column=1, sticky='ew', padx=(0, 6))
+        self.status = ctk.CTkLabel(self, text='У всіх блоках: вставте питання, щоб отримати всі різні відповіді з дужок для його повторюваних варіантів.',
                                    anchor='w', wraplength=710, justify='left', font=('Segoe UI', 11))
         self.status.grid(row=3, column=0, sticky='ew', pady=8)
         self.results = ctk.CTkScrollableFrame(self, corner_radius=12)
@@ -55,15 +58,12 @@ class EducationPage(ctk.CTkFrame):
         self.results.grid_columnconfigure(0, weight=1)
         self.text.bind('<Control-Return>', lambda e: self.search())
         self.text.bind('<Control-v>', self._paste_shortcut)
-        self._paste_binding = self.winfo_toplevel().bind('<Control-v>', self._paste_shortcut, add='+')
         self._timer = self.after(100, self._poll)
 
     def destroy(self):
         if self._timer:
             self.after_cancel(self._timer)
             self._timer = None
-        if self._paste_binding:
-            self.winfo_toplevel().unbind('<Control-v>', self._paste_binding)
         super().destroy()
 
     def _paste_shortcut(self, _event=None):
@@ -75,6 +75,17 @@ class EducationPage(ctk.CTkFrame):
             self.set_image(image)
             return 'break'
         return None
+
+    def paste_text(self):
+        """Paste clipboard text explicitly, without interfering with normal Ctrl+V."""
+        try:
+            value = self.clipboard_get()
+        except Exception:
+            messagebox.showinfo('Буфер обміну', 'У буфері обміну немає тексту. Скопіюйте запитання та натисніть «Вставити текст».', parent=self)
+            return
+        self.text.focus_set()
+        self.text.insert('insert', value)
+        self.status.configure(text='Текст вставлено. Натисніть «Знайти відповідь».')
 
     def paste_image(self):
         try:
@@ -113,6 +124,7 @@ class EducationPage(ctk.CTkFrame):
         if self.busy:
             return
         self.source_image = None
+        self.summary_answers = None
         self.preview.configure(image=None)
         self.text.delete('1.0', 'end')
         self._render([])
@@ -153,8 +165,10 @@ class EducationPage(ctk.CTkFrame):
                     except Exception as exc:
                         warning = str(exc)
                         text = ''
-                matches = self.bank.search(text, block=block, image=image, limit=30)
-                self.events.put(('result', matches, text, use_ocr, warning))
+                # Duplicate-question mode is triggered by the question text alone; the user does not need to paste options.
+                summary_answers = self.bank.duplicate_parenthetical_answers(text, block=block)
+                matches = [] if summary_answers else self.bank.search(text, block=block, image=image, limit=30)
+                self.events.put(('result', matches, text, use_ocr, warning, summary_answers))
             except Exception as exc:
                 self.events.put(('error', str(exc)))
         threading.Thread(target=worker, daemon=True).start()
@@ -168,23 +182,44 @@ class EducationPage(ctk.CTkFrame):
                 if event[0] == 'error':
                     self.status.configure(text=f'Не вдалося виконати пошук: {event[1]}')
                     continue
-                _, matches, text, use_ocr, warning = event
+                _, matches, text, use_ocr, warning, summary_answers = event
                 if use_ocr:
                     self.text.delete('1.0', 'end')
                     self.text.insert('1.0', text)
-                self._render(matches)
-                if not matches:
-                    status = 'Збігів не знайдено. Перевірте розпізнаний текст або виберіть інший блок.'
+                self.summary_answers = summary_answers or None
+                # For exact duplicate questions, show only the distinct text saved
+                # inside parentheses: one source answer per line, no option labels.
+                matches_to_render = [] if self.summary_answers else matches
+                self._render(matches_to_render, summary_answers=self.summary_answers)
+                if self.summary_answers:
+                    status = f'Відповідей із дужок для однакового питання: {len(self.summary_answers)}.'
+                elif not matches:
+                    status = 'У базі не знайдено достатніх збігів. Перевірте текст питання.'
                 else:
-                    status = 'Можливі відповіді з бази. Звірте формулювання, зображення й варіанти; розпізнаний текст можна виправити.'
+                    status = 'Можливі збіги з локальної бази.'
                 self.status.configure(text=f'{warning}\n{status}' if warning else status)
         except queue.Empty:
             pass
         self._timer = self.after(100, self._poll)
 
-    def _render(self, matches):
+    def _render(self, matches, summary_answers=None):
+        self.summary_answers = summary_answers or None
         for child in self.results.winfo_children():
             child.destroy()
+        if summary_answers:
+            card = ctk.CTkFrame(self.results, corner_radius=10)
+            card.grid(row=0, column=0, sticky='ew', padx=4, pady=5)
+            card.grid_columnconfigure(0, weight=1)
+            # Deliberately render no numbers, labels, source IDs, or AI commentary.
+            text = '\n'.join(summary_answers)
+            ctk.CTkLabel(card, text=text, wraplength=620, justify='left', anchor='w',
+                         font=('Segoe UI', 13)).grid(row=0, column=0, sticky='ew', padx=12, pady=12)
+            ctk.CTkButton(card, text='Копіювати відповіді', width=150,
+                          command=lambda value=text: self.copy_answer(value)).grid(row=1, column=0, sticky='w', padx=12, pady=(0, 10))
+            self.matches = []
+            self.shown = 0
+            self.more_button = None
+            return
         self.matches = matches
         self.shown = 0
         self.more_button = None
@@ -216,7 +251,17 @@ class EducationPage(ctk.CTkFrame):
                 label.image = preview
                 label.grid(row=3, column=0, columnspan=2, pady=(0, 10))
                 label.bind('<Button-1>', lambda e, p=path: self.zoom(p))
-            ctk.CTkLabel(card, text=f'Відповідь: {q.answer}', wraplength=620, justify='left', anchor='w',
+            pasted_text = self.text.get('1.0', 'end').strip()
+            options = parse_answer_options(pasted_text)
+            option = find_answer_option(q.answer, options)
+            if option:
+                label, option_text = option
+                answer_display = f'✓ Правильний варіант: {label}) {option_text}\nВідповідь з бази: {q.answer}'
+            else:
+                answer_display = f'Відповідь з бази: {q.answer}'
+                if options:
+                    answer_display += '\nВаріант не визначено однозначно — звірте відповідь вручну.'
+            ctk.CTkLabel(card, text=answer_display, wraplength=620, justify='left', anchor='w',
                          text_color=('#08786D', '#5EEAD4'), font=('Segoe UI', 13)).grid(row=2, column=0, columnspan=2, sticky='ew', padx=12, pady=(6, 12))
         self.shown = stop
         if stop < len(self.matches):

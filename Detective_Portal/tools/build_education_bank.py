@@ -15,7 +15,12 @@ for bid,label,file,count in blocks:
   if photo:
    image=photo[1].strip();q=q[:photo.start()].strip()
    shutil.copyfile(root/'Materialna_chastyna_zbroi_IV'/image,out/image)
-  records.append(dict(id=f'{bid}:{n}',block=bid,number=n,question=q,answer=m[3].strip(),image=image))
+  answer=m[3].strip()
+  # Keep existing parenthetical explanations; make plain source answers available
+  # to the same parentheses-only variant list without changing their wording.
+  if '(' not in answer or ')' not in answer:
+   answer=f'({answer})'
+  records.append(dict(id=f'{bid}:{n}',block=bid,number=n,question=q,answer=answer,image=image))
  metadata.append(dict(id=bid,title=label,count=count))
 (out/'questions.json').write_text(json.dumps(dict(version=1,blocks=metadata,questions=records),ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
 print('Imported',len(records),'questions',sum(bool(r['image']) for r in records),'images')
