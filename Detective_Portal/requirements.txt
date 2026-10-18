@@ -1,0 +1,15 @@
+customtkinter>=5.2.2
+selenium>=4.20.0
+webdriver-manager>=4.0.1
+openpyxl>=3.1.2
+pillow>=10.0.0
+pyinstaller>=6.0.0
+pyautogui>=0.9.54
+pyperclip>=1.9.0
+pytesseract>=0.3.13
+keyboard>=0.13.5
+pygetwindow>=0.0.9
+pywinauto>=0.6.9
+
+opencv-python>=4.8.0
+numpy>=1.24.0

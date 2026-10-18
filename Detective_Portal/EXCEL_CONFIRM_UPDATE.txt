@@ -1,0 +1,6 @@
+Excel batch confirmation update
+
+A persistent green «Особу прийнято» notification does not block the next person.
+The application now observes a fresh DOM notification update after each individual click of «Зберегти», before clicking «Нова особа».
+If the web site does not generate a new notification DOM event, the batch stops after 45 seconds for safety; verify on the site whether the last person was saved before retrying.
+This is not validated on your private web portal. Test with 1-2 records first.
