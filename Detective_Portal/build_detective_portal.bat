@@ -9,6 +9,7 @@ python -m PyInstaller ^
 --name "Helper НПУ" ^
 --icon=detective_portal_icon.ico ^
 --collect-all selenium ^
+--add-data "education_data;education_data" ^
 --hidden-import=selenium.webdriver.chrome.webdriver ^
 --hidden-import=selenium.webdriver.chrome.service ^
 --hidden-import=selenium.webdriver.common.by ^

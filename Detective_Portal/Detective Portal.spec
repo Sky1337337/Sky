@@ -1,7 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
-datas = []
+datas = [(str(Path(SPECPATH) / 'education_data'), 'education_data')]
 binaries = []
 hiddenimports = ['selenium.webdriver.chrome.webdriver', 'selenium.webdriver.chrome.service', 'selenium.webdriver.common.by', 'selenium.webdriver.common.keys', 'browser_service', 'selenium_fill', 'excel_data', 'app_state']
 tmp_ret = collect_all('selenium')

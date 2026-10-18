@@ -16,6 +16,7 @@ from PIL import Image
 from app_state import LOG_DIR, runtime, settings
 from browser_service import browser
 from excel_data import repo
+from education_ui import EducationPage
 from war_crime import WarCrimeController
 
 ctk.set_default_color_theme("blue")
@@ -81,6 +82,7 @@ class DetectivePortalPro(ctk.CTk):
             ("▥   Аналіз Excel", self.choose_analysis_excel),
             ("◎   Підключити Chrome", self.connect_chrome),
             ("⚑   Картки · F6 / F7", self.show_war_crime),
+            ("▣   Освітній портал", self.show_education),
             ("⚙   Налаштування", self.show_settings),
         ]:
             btn = ctk.CTkButton(self.sidebar, text=name, command=cmd, height=35, corner_radius=9,
@@ -210,6 +212,14 @@ class DetectivePortalPro(ctk.CTk):
         ctk.CTkLabel(panel, text="F6: встав скриншот та аналіз. F7: одне поле або дія за натискання", font=("Segoe UI", 16, "bold")).pack(padx=20, pady=20)
         ctk.CTkLabel(panel, text="F6 відкриває вікно: встав скриншот Ctrl+V і перевір розпізнане.\nДалі клацай потрібне поле Edge та натискай F7. Пошук також виконується окремим F7.").pack(pady=12)
         ctk.CTkButton(panel, text="Вставити скриншот (F6)", command=self.war_crime.start).pack(pady=(5,20))
+
+    def show_education(self):
+        self.page_title.configure(text="Освітній портал")
+        body = self._clear_body()
+        body.grid_rowconfigure(3, weight=0)
+        body.grid_rowconfigure(0, weight=1)
+        self.education_page = EducationPage(body)
+        self.education_page.grid(row=0, column=0, sticky="nsew")
 
     def show_settings(self):
         self.page_title.configure(text="Налаштування")
