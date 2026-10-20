@@ -53,3 +53,31 @@ def test_pause_toggle(app):
     runtime.running = True
     app.toggle_pause(); assert runtime.pause_event.is_set()
     app.toggle_pause(); assert not runtime.pause_event.is_set()
+
+def test_connect_progress_and_retry_after_error(app):
+    attempts = []
+
+    def connect(log):
+        log('Очікую готовності Chrome…', 'info')
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise RuntimeError('Час очікування вичерпано; повтори підключення')
+        log('Chrome підключено', 'success')
+
+    with patch('ui.browser.connect', side_effect=connect):
+        app.connect_chrome()
+        app.worker.join(timeout=2)
+        assert not app.worker.is_alive()
+        app._drain_events()
+        assert app.side_chrome.cget('text') == '● Помилка Chrome'
+        assert app.stat_status.cget('text') == 'Помилка'
+        assert 'Час очікування вичерпано' in app.log_box.get('1.0', 'end')
+
+        app.connect_chrome()
+        app.worker.join(timeout=2)
+        assert not app.worker.is_alive()
+        app._drain_events()
+        assert app.side_chrome.cget('text') == '● Chrome підключено'
+        assert app.stat_status.cget('text') == 'Готово'
+        assert 'Очікую готовності Chrome' in app.log_box.get('1.0', 'end')
+    assert len(attempts) == 2

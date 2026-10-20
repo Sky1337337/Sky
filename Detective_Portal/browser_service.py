@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
+import queue
 import shutil
 import subprocess
+import threading
 import time
+from http.client import HTTPConnection, HTTPException
 from pathlib import Path
 from typing import Callable
 
@@ -27,8 +31,13 @@ class BrowserService:
         self.driver = None
         self.current = 0
         self.analysis_current = 0
+        self._chrome_process: subprocess.Popen | None = None
+        self._chrome_port: int | None = None
 
     PORTAL_HOST = "detective.in.np.gov.ua"
+    CONNECT_TIMEOUT = 30.0
+    CONNECT_POLL_INTERVAL = 0.5
+    DEBUG_PROBE_TIMEOUT = 1.0
 
     def _select_portal_tab(self) -> bool:
         """Recover after a Chrome tab closes; never write into an unrelated tab."""
@@ -83,25 +92,184 @@ class BrowserService:
         ]
         return next((p for p in candidates if p and Path(p).exists()), None)
 
+    @staticmethod
+    def _debugger_ready(port: int, timeout: float) -> bool:
+        """Probe DevTools directly on loopback, without system HTTP proxies."""
+        connection = HTTPConnection("127.0.0.1", port, timeout=timeout)
+        try:
+            connection.request("GET", "/json/version")
+            response = connection.getresponse()
+            if response.status != 200:
+                return False
+            # A listening TCP port (or an unrelated HTTP server) is not enough.
+            payload = json.loads(response.read(65536))
+            if not isinstance(payload, dict):
+                return False
+            browser_name = payload.get("Browser", "")
+            websocket = payload.get("webSocketDebuggerUrl", "")
+            return (
+                isinstance(browser_name, str)
+                and browser_name.startswith(("Chrome/", "Chromium/"))
+                and isinstance(websocket, str)
+                and websocket.startswith("ws://")
+            )
+        except (OSError, HTTPException, ValueError):
+            return False
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _connection_step(action: Callable, timeout: float, cleanup: Callable | None = None):
+        """Bound a blocking dependency call; discard and clean up late results."""
+        if timeout <= 0:
+            raise TimeoutError("Час очікування підключення вичерпано")
+        outcome: queue.Queue = queue.Queue(maxsize=1)
+        abandoned = threading.Event()
+
+        def clean_up():
+            try:
+                if cleanup is not None:
+                    cleanup()
+            except Exception:
+                pass
+
+        def run():
+            try:
+                result = action()
+            except Exception as exc:
+                clean_up()
+                outcome.put((None, exc))
+            else:
+                outcome.put((result, None))
+            finally:
+                if abandoned.is_set():
+                    clean_up()
+
+        deadline = time.monotonic() + timeout
+        threading.Thread(target=run, daemon=True).start()
+        try:
+            result, error = outcome.get(timeout=max(0, deadline - time.monotonic()))
+            if time.monotonic() >= deadline:
+                raise queue.Empty
+        except queue.Empty:
+            abandoned.set()
+            # Cleanup must not extend the deadline either. The worker also
+            # cleans up if ChromeDriver only finishes starting after timeout.
+            threading.Thread(target=clean_up, daemon=True).start()
+            raise TimeoutError("Час очікування підключення вичерпано") from None
+        if error is not None:
+            raise error
+        return result
+
+    def _probe_debugger(self, port: int, timeout: float) -> bool:
+        try:
+            return self._connection_step(
+                lambda: self._debugger_ready(port, timeout), timeout
+            )
+        except TimeoutError:
+            return False
+
     def connect(self, log: LogFn) -> None:
-        chrome = self.find_chrome()
-        if not chrome:
-            raise RuntimeError("Google Chrome не знайдено")
-        profile = Path.home() / "AppData/Local/DetectivePortalPro/ChromeProfile"
-        profile.mkdir(parents=True, exist_ok=True)
-        subprocess.Popen([
-            chrome,
-            f"--remote-debugging-port={settings.chrome_debug_port}",
-            f"--user-data-dir={profile}",
-            "--no-first-run",
-        ])
-        log("Запускаю Chrome у режимі віддаленого керування…", "info")
-        time.sleep(3)
+        port = settings.chrome_debug_port
+        address = f"127.0.0.1:{port}"
+        # Drop a stale attachment without closing the user's debugging Chrome.
+        old_driver, self.driver = self.driver, None
+        if old_driver is not None:
+            try:
+                self._connection_step(old_driver.service.stop, self.DEBUG_PROBE_TIMEOUT)
+            except (OSError, WebDriverException):
+                pass
+
+        log(f"Готую ChromeDriver для підключення (до {self.CONNECT_TIMEOUT:g} с)…", "info")
+        try:
+            driver_path = self._connection_step(
+                lambda: ChromeDriverManager().install(), self.CONNECT_TIMEOUT
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Не вдалося підготувати ChromeDriver за {self.CONNECT_TIMEOUT:g} с. Перевір доступ до мережі "
+                "та повтори підключення."
+            ) from exc
+
+        deadline = time.monotonic() + self.CONNECT_TIMEOUT
+        ready = self._probe_debugger(port, min(self.DEBUG_PROBE_TIMEOUT, self.CONNECT_TIMEOUT))
+        if ready:
+            log(f"Використовую вже запущений Chrome ({address})…", "info")
+        elif (
+            self._chrome_process is not None
+            and self._chrome_port == port
+            and self._chrome_process.poll() is None
+        ):
+            log("Chrome ще запускається; очікую без запуску іншого екземпляра…", "info")
+        elif time.monotonic() < deadline:
+            chrome = self.find_chrome()
+            if not chrome:
+                raise RuntimeError("Google Chrome не знайдено. Встанови Chrome та повтори підключення.")
+            profile = Path.home() / "AppData/Local/DetectivePortalPro/ChromeProfile"
+            profile.mkdir(parents=True, exist_ok=True)
+            try:
+                self._chrome_process = subprocess.Popen([
+                    chrome,
+                    f"--remote-debugging-port={port}",
+                    f"--user-data-dir={profile}",
+                    "--no-first-run",
+                ])
+            except OSError as exc:
+                raise RuntimeError(f"Не вдалося запустити Google Chrome: {exc}") from exc
+            self._chrome_port = port
+            log("Запускаю Chrome у режимі віддаленого керування…", "info")
+
+        log(f"Очікую підключення Chrome ({address}), до {self.CONNECT_TIMEOUT:g} с…", "info")
         options = Options()
-        options.debugger_address = f"127.0.0.1:{settings.chrome_debug_port}"
-        service = Service(ChromeDriverManager().install())
-        self.driver = webdriver.Chrome(service=service, options=options)
-        log("Chrome підключено. Перед внесенням відкрий detective.in.np.gov.ua у цьому Chrome.", "success")
+        options.debugger_address = address
+        last_error = None
+        attempts = 0
+        while time.monotonic() < deadline:
+            if not ready:
+                ready = self._probe_debugger(
+                    port, min(self.DEBUG_PROBE_TIMEOUT, deadline - time.monotonic())
+                )
+            if time.monotonic() >= deadline:
+                break
+            if ready:
+                attempts += 1
+                log(f"Chrome готовий. Підключаю Selenium (спроба {attempts})…", "info")
+                # A failed constructor may leave a service behind. Each retry
+                # gets a fresh ChromeDriver, but never another Chrome process.
+                service = Service(driver_path)
+                try:
+                    self.driver = self._connection_step(
+                        lambda: webdriver.Chrome(service=service, options=options),
+                        deadline - time.monotonic(),
+                        # Stop ChromeDriver, keeping debugging Chrome and tabs.
+                        cleanup=service.stop,
+                    )
+                except TimeoutError as exc:
+                    last_error = exc
+                    break
+                except WebDriverException as exc:
+                    last_error = exc
+                    log("Selenium поки не підключився; повторюю в межах часу очікування…", "warning")
+                else:
+                    log("Chrome підключено. Перед внесенням відкрий detective.in.np.gov.ua у цьому Chrome.", "success")
+                    return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(self.CONNECT_POLL_INTERVAL, remaining))
+            ready = False
+
+        detail = "Selenium не зміг приєднатися" if last_error else "відладочний порт Chrome не готовий"
+        last_detail = ""
+        if last_error is not None:
+            reason = getattr(last_error, "msg", None) or str(last_error)
+            reason = " ".join(reason.split())[:240]
+            last_detail = f" Остання помилка Selenium: {reason}."
+        raise RuntimeError(
+            f"Не вдалося підключити Chrome ({address}): {detail} "
+            f"за {self.CONNECT_TIMEOUT:g} с; спроб Selenium: {attempts}.{last_detail} "
+            "Перевір Chrome і порт у налаштуваннях та натисни «Підключити Chrome» ще раз."
+        ) from last_error
 
     def _inputs(self):
         return self.driver.find_elements(By.TAG_NAME, "input") if self.connected else []
